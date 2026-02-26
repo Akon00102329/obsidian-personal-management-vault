@@ -1086,14 +1086,14 @@ try {
         labels: ["gasto", "ingreso", "cuentas"],
         datasets: [
           {
-            label: `Tarjeta (total ${mov.expenseScope})`,
+            label: `Tarjeta (total ${mov.expenseScope.toFixed(2)})`,
             data: [mov.gastoTarjeta, null, null],
             stack: "gastos",
             yAxisID: "yMoney",
             backgroundColor: ThemeUtils.themeColor("--color-red"),
           },
           {
-            label: `Efectivo (total ${mov.expenseScope})`,
+            label: `Efectivo (total ${mov.expenseScope.toFixed(2)})`,
             data: [mov.gastoEfectivo, null, null],
             stack: "gastos",
             yAxisID: "yMoney",
