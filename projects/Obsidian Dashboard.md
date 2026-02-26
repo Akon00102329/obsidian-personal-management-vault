@@ -33,8 +33,8 @@ Obtener un panel de visualización del estado de mi vida, mis finanzas y mi desa
 > - [x] Mejora UI: Esconder títulos de elementos si no existe la información precisa (sobre todo en el apartado finanzas)
 > - [x] Mejora UI: seguir el tema del usuario
 > - [x] **config** separar la configuración
-> - [ ] **config** crear repositorio con datos de prueba para testear, hacer version control y hacerlo público
-> - [ ] **config** configurar el `.gitignore` para que no exista ningún compromiso de datos personales
+> - [x] **config** crear repositorio con datos de prueba para testear, hacer version control y hacerlo público
+> - [x] **config** configurar el `.gitignore` para que no exista ningún compromiso de datos personales
 > - [x] **feat** hacer la config segura contra errores
 # Refactor
 - [ ] mejorar la estructura de finance scope
