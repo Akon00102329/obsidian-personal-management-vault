@@ -1,11 +1,10 @@
 > A template of my obsidian vault, with a focus on personal development, relationships accountability and project management
 
 This is a desktop-only vault for the moment
-
-![[calendar.png]]
-![[dashboard_showcase.png]]
-Theme responsive
-![[color_change.png]]
+<p align="center"><img width="800" alt="Semi_Transparent" src="https://github.com/Akon00102329/obsidian-personal-management-vault/blob/main/attachments/calendar.png?raw=true"></p>
+<p align="center"><img width="800" alt="Semi_Transparent" src="https://raw.githubusercontent.com/Akon00102329/obsidian-personal-management-vault/refs/heads/main/attachments/dashboard_showcase.png"></p>
+> Aligned with your theme
+<p align="center"><img width="800" alt="Semi_Transparent" src="https://raw.githubusercontent.com/Akon00102329/obsidian-personal-management-vault/refs/heads/main/attachments/color_change.png"></p>
 # Plugins installed
 From most to least important:
 - Dataview (crucial, do not touch)
