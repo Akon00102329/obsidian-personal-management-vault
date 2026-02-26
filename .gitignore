@@ -7,7 +7,9 @@
 /projects/*
 !/projects/Obsidian\ Dashboard.md
 /attachments/*
-!/attachments/showcase/*
+!/attachments/calendar.png
+!/attachments/color_change.png
+!/attachments/dashboard_showcase.png
 # la carpeta .stfolder
 /.stfolder
 # la carpetas theme y appearance.json, app.json
