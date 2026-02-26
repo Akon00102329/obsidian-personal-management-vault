@@ -2,6 +2,10 @@
 
 This is a desktop-only vault for the moment
 
+![[calendar.png]]
+![[dashboard_showcase.png]]
+Theme responsive
+![[color_change.png]]
 # Plugins installed
 From most to least important:
 - Dataview (crucial, do not touch)
@@ -32,6 +36,7 @@ For everyday use, it has diferent sections:
 - gastos: tracks the movements on your finances: income revenues, expenses, movement accross accounts
 - planes: you can place here the upcoming events such as appointments, exams, dates, hangouts, events, etc. It is not a schedule. There is no order apart from the order of occurrence you have in your notes
 - Tareas: section to insert the 3 most important tasks of the day. It is planned to program a rollout for the tasks undone in this section
+
 It also tracks the following:
 - bedtime and waketime: approximately anotate this data to get your sleep hours
 - sleepQuality: you can also track (from 1 to 5) how recovering was your sleep schedule. Take in consideration insomnia, feeling recovered, waking up in the middle of the night, irregular sleep schedule, mine is based on the following:
@@ -43,7 +48,7 @@ It also tracks the following:
 - water intake: how much water you drank today
 - emotion: your main emotion at the end of the day, how the most impactful event left you feeling
 ## personas
-A simpple tool for managing your relationships, you can add the birthday of a person and it will appear on the calendar. You can also add undefined plans and some information about them so you can easily recall memories and find gift ideas or future plans
+A simple tool for managing your relationships, you can add the birthday of a person and it will appear on the calendar. You can also add undefined plans and some information about them so you can easily recall memories and find gift ideas or future plans
 ## projects
 A template based on David Allen's Getting Things Done template
 ## resources
