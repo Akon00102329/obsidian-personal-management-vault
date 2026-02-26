@@ -1,14 +1,20 @@
 try {
   let { account, savings, cash, savings_goal, track_gym } = input;
 
+  console.log({
+    card: typeof account !== "number",
+    s_goal: typeof savings_goal !== "number",
+    savings: typeof savings !== "number",
+    cash: typeof cash !== "number",
+  });
   if (
-    typeof card !== Number ||
-    typeof savings_goal !== Number ||
-    typeof savings !== Number ||
-    typeof cash !== Number
+    typeof account !== "number" ||
+    typeof savings_goal !== "number" ||
+    typeof savings !== "number" ||
+    typeof cash !== "number"
   ) {
     dv.span(
-      ">[!ERROR] ERROR: debe ser un número\n> las variables `account, card, savings, savings_goal` deben ser números",
+      ">[!ERROR] ERROR: debe ser un número\n> las variables `account, cash, savings, savings_goal` deben ser números",
     );
     return false;
   }
@@ -1236,7 +1242,7 @@ try {
 } catch (error) {
   if (!input) {
     dv.span(
-      '> [!ERROR] ERROR: No se han agregado las llaves\n> \n> Debe introducir los siguientes parámetros\n>\n> `{card: "", cash: "", savings: "", savings_goal: ""}`\n> para continuar.\n>\n> Si no quiere añadir ningún valor, solo mantenga las llaves "`{}`"\n> ejemplo:\n> ```\n> dv.view("scripts/dashboard.js",{})\n>                                ^^\n>```\n>',
+      '> [!ERROR] ERROR: No se han agregado las llaves\n> \n> Debe introducir los siguientes parámetros\n>\n> `{account: "", cash: "", savings: "", savings_goal: ""}`\n> para continuar.\n>\n> Si no quiere añadir ningún valor, solo mantenga las llaves "`{}`"\n> ejemplo:\n> ```\n> dv.view("scripts/dashboard.js",{})\n>                                ^^\n>```\n>',
     );
   }
 }
