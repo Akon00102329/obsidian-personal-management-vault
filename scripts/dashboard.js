@@ -385,7 +385,6 @@ try {
         const tags = item.tags ?? [];
         const iso = item.path.replace(/^.*\/(\d{4}-\d{2}-\d{2})\.md$/, "$1");
         const date = item.task ? item.completion : DateTime.fromISO(iso);
-        const month = DateUtils.monthIndexer(date);
 
         const specialSet = new Set(Object.keys(specialHandlers));
 
@@ -424,11 +423,15 @@ try {
           cardDelta: deltas.card,
         };
 
-        finance.movements.push(movInScope);
-        finance.byMonth[month] ??= [];
-        finance.byMonth[month].push(movInScope);
-        finance.byDay[iso] ??= [];
-        finance.byDay[iso].push(movInScope);
+        if (!item.task && !item.done) {
+          const month = DateUtils.monthIndexer(date);
+
+          finance.movements.push(movInScope);
+          finance.byMonth[month] ??= [];
+          finance.byMonth[month].push(movInScope);
+          finance.byDay[iso] ??= [];
+          finance.byDay[iso].push(movInScope);
+        }
       }
 
       return { journal, projects, birthdays, finance };
@@ -1240,6 +1243,7 @@ try {
   renderProjects(indexed.projectRecords);
   await renderAll();
 } catch (error) {
+  console.log(error);
   if (!input) {
     dv.span(
       '> [!ERROR] ERROR: No se han agregado las llaves\n> \n> Debe introducir los siguientes parámetros\n>\n> `{account: "", cash: "", savings: "", savings_goal: ""}`\n> para continuar.\n>\n> Si no quiere añadir ningún valor, solo mantenga las llaves "`{}`"\n> ejemplo:\n> ```\n> dv.view("scripts/dashboard.js",{})\n>                                ^^\n>```\n>',
