@@ -1,0 +1,103 @@
+.dashboard-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.header {
+  border: 1px solid var(--background-modifier-border);
+  background: var(--color-accent);
+}
+.projects-page {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.project-paginator {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.project-canvas {
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.project-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--background-secondary);
+}
+.project-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.calendar-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.calendar-table th,
+.calendar-table td {
+  border: 1px solid var(--background-modifier-border);
+  text-align: center;
+  padding: 6px;
+}
+.day-link {
+  cursor: pointer;
+  text-decoration: underline;
+}
+.current-month,
+.finance-table th {
+  background: var(--color-accent);
+  color: inherit;
+}
+.other-month {
+  background: var(--color-accent-2);
+}
+.col-page,
+.plan-cell {
+  background: var(--background-secondary);
+}
+.sleep-canvas {
+  margin-top: 16px;
+  max-width: 100%;
+  height: 220px;
+}
+.finance-wrap {
+  margin-top: 8px;
+}
+.finance-table {
+  margin-top: 12px;
+  width: 100%;
+  border-collapse: collapse;
+}
+.finance-table td {
+  border: 1px solid var(--background-modifier-border);
+  padding: 6px;
+  text-align: left;
+}
+.finance-charts {
+  display: flex;
+  style {
+    width: 100%;
+    height: "200px";
+    position: "relative";
+    flex-wrap: "nowrap";
+  }
+}
+.finance-charts .left {
+  flex: 2 1 0;
+  min-width: 0;
+  position: relative;
+}
+
+.finance-charts .right {
+  flex: 1 1 0;
+  min-width: 0;
+  position: relative;
+}

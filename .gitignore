@@ -1,0 +1,16 @@
+# todos los archivos dentro de las carpetas menos scripts y templates
+/attachments/*
+/journal/*
+/personas/*
+/resources/*
+/reviews/*
+# todos los proyectos menos "obsidian dashboard"
+/projects/*
+!/projects/Obsidian\ Dashboard.md
+# la carpeta .stfolder
+/.stfolder
+# la carpetas theme y appearance.json, app.json
+/.obsidian/themes/*
+/.obsidian/appearance.json
+/.obsidian/app.json
+/Dashboard.md

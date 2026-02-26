@@ -1,0 +1,15 @@
+{
+  "types": {
+    "aliases": "aliases",
+    "cssclasses": "multitext",
+    "tags": "tags",
+    "bedtime": "datetime",
+    "waketime": "datetime",
+    "exercise": "text",
+    "waterIntake": "number",
+    "sleepQuality": "number",
+    "deadline": "date",
+    "birth": "date",
+    "revisionTime": "text"
+  }
+}
