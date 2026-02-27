@@ -100,6 +100,7 @@ try {
       if (!completed) {
         if (raw >= 0) finance.debts.cobrar.push(item);
         else finance.debts.pagar.push(item);
+        console.log("culpable");
         return null; // omite la fila
       }
       return {
@@ -409,7 +410,8 @@ try {
           deltas = handlers["default"](raw, category);
         }
 
-        deltas.category = category;
+        // si es una deuda pendiente, no agregar
+        if (!deltas) continue;
 
         const movInScope = {
           date,
@@ -423,15 +425,13 @@ try {
           cardDelta: deltas.card,
         };
 
-        if (!item.task && !item.done) {
-          const month = DateUtils.monthIndexer(date);
+        const month = DateUtils.monthIndexer(date);
 
-          finance.movements.push(movInScope);
-          finance.byMonth[month] ??= [];
-          finance.byMonth[month].push(movInScope);
-          finance.byDay[iso] ??= [];
-          finance.byDay[iso].push(movInScope);
-        }
+        finance.movements.push(movInScope);
+        finance.byMonth[month] ??= [];
+        finance.byMonth[month].push(movInScope);
+        finance.byDay[iso] ??= [];
+        finance.byDay[iso].push(movInScope);
       }
 
       return { journal, projects, birthdays, finance };
@@ -588,7 +588,7 @@ try {
       savingsSnapshot;
 
     // desde checkpoint si existe
-    if (finance.byMonth[DateUtils.monthIndexer(ref)] === undefined) {
+    if (finance.byMonth[DateUtils.monthIndexer(ref)] !== undefined) {
       movsFromCheckpoint = finance.byMonth[DateUtils.monthIndexer(ref)];
       const check = await checkpoint(DateUtils.monthIndexer(ref));
       cardSnapshot = Number(check.card);
@@ -1022,7 +1022,7 @@ try {
       );
 
     if (cobrarTasks.length) {
-      dv.header(2, `A cobrar (total ${cobrarTotal} `);
+      dv.header(2, `A cobrar (total ${cobrarTotal})`);
       dv.taskList(cobrarTasks, false);
     }
 
