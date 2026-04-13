@@ -1,40 +1,77 @@
 try {
-  let { account, savings, cash, savings_goal, track_gym } = input;
+  let { account, savings, cash, savings_goal, def_scope, track_gym } = input;
 
-  console.log({
-    card: typeof account !== "number",
-    s_goal: typeof savings_goal !== "number",
-    savings: typeof savings !== "number",
-    cash: typeof cash !== "number",
-  });
   if (
-    typeof account !== "number" ||
-    typeof savings_goal !== "number" ||
-    typeof savings !== "number" ||
-    typeof cash !== "number"
+    (account && typeof account !== "number") ||
+    (savings && typeof savings !== "number") ||
+    (cash && typeof cash !== "number") ||
+    (savings_goal && typeof savings_goal !== "number")
   ) {
     dv.span(
       ">[!ERROR] ERROR: debe ser un número\n> las variables `account, cash, savings, savings_goal` deben ser números",
     );
     return false;
   }
-  /* ========== apartado CONFIG ========== */
+  if (def_scope && def_scope !== "week" && def_scope !== "month") {
+    dv.span(">[!ERROR] ERROR: `def_scope` solo puede ser `week` o `month`");
+    return false;
+  }
+
+  /* ========== apartado CONFIG y variables globales ========== */
   const CONFIG = {
     INITIAL_MONEY: account ? account : 0,
     INITIAL_CASH: cash ? cash : 0,
     INITIAL_SAVINGS: savings ? savings : 0,
     SAVINGS_GOAL: savings_goal,
     TRACK_GYM: track_gym ? track_gym : false,
+    DEFAULT_SCOPE: def_scope ? def_scope : "week",
     WEEKDAYS: ["lun", "mar", "mie", "jue", "vie", "sab", "dom"],
     PROJECTS_PAGE_SIZE: 3,
   };
 
+  const json = await dv.io.load("scripts/checkpoints.json"); // carga de los snapshots de finanzas
   const DateTime = dv.luxon.DateTime;
-  let state = {
-    scope: "week",
+  const moneyRegex = /([+-]?\d+(?:[.,]\d+)?).*?#([\p{L}\w-]+)/u;
+
+  /** globalCache: contiene el estado de todas las EDAs */
+  const globalCache = {
+    paginator: {
+      page: 0,
+      pageSize: 0,
+    },
+    scope: CONFIG.DEFAULT_SCOPE,
     ref: DateTime.now(),
+    finance: {
+      scoped: {
+        cash: 0,
+        card: 0,
+        income: 0,
+        expense: 0,
+        byCategory: {},
+      },
+      byMonth: {},
+      debts: {
+        cobrar: [],
+        pagar: [],
+        totalCobrar: 0,
+        totalPagar: 0,
+        isEmpty: true,
+      },
+    },
+    projects: {},
+    habits: new Set(),
+    weeks: {},
+    healthIndex: {
+      isEmpty: true,
+      days: [],
+      quality: [],
+      water: [],
+      hours: [],
+    },
+    init: false,
   };
-  /* ========== CARGAR CSS ========== */
+
+  /* ========== CARGAR CSS y CHARTJS ========== */
   async function loadExternalCSS(path) {
     try {
       const file = app.vault.getAbstractFileByPath(path);
@@ -47,8 +84,7 @@ try {
       // no fallar si no existe
     }
   }
-  await loadExternalCSS("scripts/dashboard.css");
-  /* ========== Chart.js LOAD ========== */
+
   async function loadChartJS() {
     if (window.Chart) return;
     await new Promise((res) => {
@@ -58,22 +94,244 @@ try {
       document.head.appendChild(s);
     });
   }
+  await loadExternalCSS("scripts/dashboard.css");
   await loadChartJS();
 
-  /* ========== apartado UTILS ========== */
-  async function checkpoint(refMonth) {
-    let checkpoints = {};
-    const checkpointPath = "scripts/checkpoints.json";
-    const file = app.vault.getAbstractFileByPath(checkpointPath);
-    if (checkpoints) {
-      if (file) {
-        const content = await app.vault.read(file);
-        checkpoints = JSON.parse(content);
+  /*
+   *
+   * utils
+   *
+   */
+
+  /*
+   * TASK UTILS
+   *
+   */
+  const LIST_ITEM_REGEX =
+    /^[\s>]*(\d+\.|\d+\)|\*|-|\+)\s*(\[.{0,1}\])?\s*(.*)$/mu;
+  async function rewriteTask(task, desiredStatus, desiredText) {
+    if (
+      desiredStatus == task.status &&
+      (desiredText == undefined || desiredText == task.text)
+    )
+      return;
+    desiredStatus = desiredStatus == "" ? " " : desiredStatus;
+    let rawFiletext = await app.vault.adapter.read(task.path);
+    let hasRN = rawFiletext.contains("\r");
+    let filetext = rawFiletext.split(/\r?\n/u);
+    if (filetext.length < task.line) return;
+    let match = LIST_ITEM_REGEX.exec(filetext[task.line]);
+    if (!match || match[2].length == 0) return;
+    let taskTextParts = task.text.split("\n");
+    if (taskTextParts[0].trim() != match[3].trim()) return;
+    // We have a positive match here at this point, so go ahead and do the rewrite of the status.
+    let initialSpacing = /^[\s>]*/u.exec(filetext[task.line])[0];
+    if (desiredText) {
+      let desiredParts = desiredText.split("\n");
+      let newTextLines = [
+        `${initialSpacing}${task.symbol} [${desiredStatus}] ${desiredParts[0]}`,
+      ].concat(desiredParts.slice(1).map((l) => initialSpacing + "\t" + l));
+      filetext.splice(task.line, task.lineCount, ...newTextLines);
+    } else {
+      filetext[task.line] =
+        `${initialSpacing}${task.symbol} [${desiredStatus}] ${taskTextParts[0].trim()}`;
+    }
+    let newText = filetext.join(hasRN ? "\r\n" : "\n");
+    await app.vault.adapter.write(task.path, newText);
+  }
+
+  function findSeparator(line, start) {
+    let sep = line.indexOf("::", start);
+    if (sep < 0) return undefined;
+    return { key: line.substring(start, sep).trim(), valueIndex: sep + 2 };
+  }
+
+  const INLINE_FIELD_WRAPPERS = Object.freeze({
+    "[": "]",
+    "(": ")",
+  });
+
+  function findClosing(line, start, open, close) {
+    let nesting = 0;
+    let escaped = false;
+    for (let index = start; index < line.length; index++) {
+      let char = line.charAt(index);
+      // Allows for double escapes like '\\' to be rendered normally.
+      if (char == "\\") {
+        escaped = !escaped;
+        continue;
+      }
+      // If escaped, ignore the next character for computing nesting, regardless of what it is.
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char == open) nesting++;
+      else if (char == close) nesting--;
+      // Only occurs if we are on a close character and there is no more nesting.
+      if (nesting < 0)
+        return {
+          value: line.substring(start, index).trim(),
+          endIndex: index + 1,
+        };
+      escaped = false;
+    }
+    return undefined;
+  }
+  function findSpecificInlineField(line, start) {
+    let open = line.charAt(start);
+    let key = findSeparator(line, start + 1);
+    if (key === undefined) return undefined;
+    // Fail the match if we find any separator characters (not allowed in keys).
+    for (let sep of Object.keys(INLINE_FIELD_WRAPPERS).concat(
+      Object.values(INLINE_FIELD_WRAPPERS),
+    )) {
+      if (key.key.includes(sep)) return undefined;
+    }
+    let value = findClosing(
+      line,
+      key.valueIndex,
+      open,
+      INLINE_FIELD_WRAPPERS[open],
+    );
+    if (value === undefined) return undefined;
+    return {
+      key: key.key,
+      value: value.value,
+      start: start,
+      startValue: key.valueIndex,
+      end: value.endIndex,
+      wrapping: open,
+    };
+  }
+
+  function extractInlineFields(line) {
+    let fields = [];
+    for (let wrapper of Object.keys(INLINE_FIELD_WRAPPERS)) {
+      let foundIndex = line.indexOf(wrapper);
+      while (foundIndex >= 0) {
+        let parsedField = findSpecificInlineField(line, foundIndex);
+        if (!parsedField) {
+          foundIndex = line.indexOf(wrapper, foundIndex + 1);
+          continue;
+        }
+        fields.push(parsedField);
+        foundIndex = line.indexOf(wrapper, parsedField.end);
       }
     }
-
-    return checkpoints[refMonth];
+    fields.sort((a, b) => a.start - b.start);
+    let filteredFields = [];
+    for (let i = 0; i < fields.length; i++) {
+      if (
+        i == 0 ||
+        filteredFields[filteredFields.length - 1].end < fields[i].start
+      ) {
+        filteredFields.push(fields[i]);
+      }
+    }
+    return filteredFields;
   }
+  function setInlineField(source, key, value) {
+    let existing = extractInlineFields(source);
+    let existingKeys = existing.filter((f) => f.key == key);
+    // Don't do anything if there are duplicate keys OR the key already doesn't exist.
+    if (existingKeys.length > 2 || (existingKeys.length == 0 && !value))
+      return source;
+    let existingKey = existingKeys[0];
+    let annotation = value ? `[${key}:: ${value}]` : "";
+    if (existingKey) {
+      let prefix = source.substring(0, existingKey.start);
+      let suffix = source.substring(existingKey.end);
+      if (annotation) return `${prefix}${annotation}${suffix}`;
+      else return `${prefix}${suffix.trimStart()}`;
+    } else if (annotation) {
+      return `${source.trimEnd()} ${annotation}`;
+    }
+    return source;
+  }
+
+  function setTaskCompletion(
+    originalText,
+    completionKey,
+    completionDateFormat,
+  ) {
+    const blockIdRegex = /\^[a-z0-9\-]+/i;
+    let parts = originalText.split(/\r?\n/u);
+    const matches = blockIdRegex.exec(parts[parts.length - 1]);
+    let processedPart = parts[parts.length - 1].split(blockIdRegex).join(""); // last part without block id
+    processedPart = setInlineField(
+      processedPart,
+      completionKey,
+      DateTime.now().toFormat(completionDateFormat),
+    );
+
+    processedPart =
+      `${processedPart.trimEnd()}${matches?.length ? " " + matches[0].trim() : ""}`.trimEnd(); // add back block id
+    parts[parts.length - 1] = processedPart;
+    return parts.join("\n");
+  }
+  /** renderiza un checkbox */
+  function TaskItemDOM(item) {
+    const li = document.createElement("li");
+    li.className = "dataview task-list-item";
+    li.setAttribute("data-task", item.status);
+
+    const checkbox = document.createElement("input");
+    checkbox.className = "dataview task-list-item-checkbox";
+    checkbox.type = "checkbox";
+    checkbox.checked = item.status !== " ";
+    checkbox.addEventListener("click", onChecked);
+
+    const content = document.createElement("span");
+    content.textContent = item.visual ?? item.text;
+
+    li.append(checkbox, content);
+
+    if (item.children?.length) {
+      li.append(TaskListDOM(item.children));
+    }
+
+    function onChecked(evt) {
+      const completed = evt.currentTarget.checked;
+      const status = completed ? "x" : " ";
+      li.setAttribute("data-task", status);
+
+      let flatted = [item];
+      function flatter(iitem) {
+        flatted.push(iitem);
+        iitem.children.forEach(flatter);
+      }
+      item.children.forEach(flatter);
+      flatted = flatted.flat(Infinity);
+
+      (async () => {
+        for (let i = 0; i < flatted.length; i++) {
+          const _item = flatted[i];
+          let updatedText = setTaskCompletion(
+            _item.text,
+            "fechaPagado",
+            "yyyy-MM-dd",
+          );
+          await rewriteTask(_item, status, updatedText);
+        }
+        app.workspace.trigger("dataview:refresh-views");
+      })();
+    }
+
+    return li;
+  }
+
+  function TaskListDOM(items) {
+    const ul = document.createElement("ul");
+    ul.className = "contains-task-list";
+
+    for (const item of items) {
+      ul.append(TaskItemDOM(item));
+    }
+
+    return ul;
+  }
+
   const handlers = {
     ahorro: (raw, category) => ({
       card: raw >= 0 ? -raw : Math.abs(raw),
@@ -96,12 +354,17 @@ try {
       cat: category,
       type: "efectivo",
     }),
-    deuda: (raw, category, completed, item, finance) => {
+    deuda: (raw, category, completed, item) => {
       if (!completed) {
-        if (raw >= 0) finance.debts.cobrar.push(item);
-        else finance.debts.pagar.push(item);
-        console.log("culpable");
-        return null; // omite la fila
+        if (raw >= 0) {
+          globalCache.finance.debts.cobrar.push(item);
+          globalCache.finance.debts.totalCobrar += raw;
+        } else {
+          globalCache.finance.debts.pagar.push(item);
+          globalCache.finance.debts.totalPagar += Math.abs(raw);
+        }
+        globalCache.finance.debts.isEmpty = false;
+        return null;
       }
       return {
         card: raw,
@@ -120,6 +383,18 @@ try {
     }),
   };
 
+  /** devuelve el snapshot de las cuentas dado un movimiento*/
+  const calcSnapshotAtMovement = (delta, previousState) => ({
+    card: previousState.card + delta.card,
+    savings: previousState.savings + delta.savings,
+    cash: previousState.cash + delta.cash,
+  });
+
+  /** Devuelve un numero decimal en formato D.DD€*/
+  function parseMoney(cuantity) {
+    return `${Math.abs(cuantity).toFixed(2)}€`;
+  }
+
   const specialHandlers = {
     "#ahorro": handlers["ahorro"],
     "#reintegro": handlers["reintegro"],
@@ -127,186 +402,112 @@ try {
     "#deuda": handlers["deuda"],
   };
 
-  const css = getComputedStyle(document.body);
+  /**
+   *
+   * DATE UTILS
+   *
+   */
 
-  const ThemeUtils = {
-    themeColor(name) {
-      return css.getPropertyValue(name).trim();
-    },
+  function diffHours(end, start) {
+    return DateTime.fromISO(end).diff(DateTime.fromISO(start)).as("hours");
+  }
+  /** crea una entrada en el objeto weeks para cada dia existente en journal*/
+  function ensureDay(date) {
+    const iso = date.toISODate();
+    const w = weekIndexer(date);
+    globalCache.weeks[w] ??= { days: {} };
+    globalCache.weeks[w].days[iso] ??= { habits: {}, events: [], page: null };
+    return globalCache.weeks[w].days[iso];
+  }
+  /** devuelve una semana entera de lunes a domingo dado un día */
+  function daysOfWeek(ref) {
+    const start = ref.startOf("week");
+    return Array.from({ length: 7 }, (_, i) => start.plus({ days: i }));
+  }
 
-    transparentize(color, opacity = 0.5) {
-      color = color.trim();
+  /**
+   *  devuelve todas las semanas de lunes a domingo que incluyen al mes dado un día de esta forma, puede
+   *  agregar parte del mes anterior o pasado para completar la semana util para vistas de calendario
+   **/
+  function weeksOfMonth(ref) {
+    const start = ref.startOf("month").startOf("week");
+    const end = ref.endOf("month").endOf("week");
+    let cur = start;
+    const weeks = [];
+    while (cur <= end) {
+      weeks.push(daysOfWeek(cur));
+      cur = cur.plus({ weeks: 1 });
+    }
+    return weeks;
+  }
 
-      // hex
-      if (color.startsWith("#")) {
-        let r, g, b;
-        if (color.length === 4) {
-          r = parseInt(color[1] + color[1], 16);
-          g = parseInt(color[2] + color[2], 16);
-          b = parseInt(color[3] + color[3], 16);
-        } else if (color.length === 7) {
-          r = parseInt(color.slice(1, 3), 16);
-          g = parseInt(color.slice(3, 5), 16);
-          b = parseInt(color.slice(5, 7), 16);
-        } else {
-          return color;
-        }
-        return `rgba(${r}, ${g}, ${b}, ${opacity})`;
-      }
+  /* devuelve un array con todo el mes dada una fecha */
+  function daysOfMonth(ref) {
+    return Array.from({ length: ref.daysInMonth }, (_, i) =>
+      ref.startOf("month").plus({ days: i }),
+    );
+  }
 
-      let rgbMatch = color.match(/rgba?\(\s*([^\)]+)\)/);
-      if (rgbMatch) {
-        const parts = rgbMatch[1].split(",").map((v) => Number(v.trim()));
-        if (parts.length >= 3) {
-          const [r, g, b] = parts;
-          return `rgba(${r}, ${g}, ${b}, ${opacity})`;
-        }
-      }
+  /* comprueba si la fecha dada está dentro del alcance de la vista, true si esta dentro del alcance, false caso contrario */
+  function inScope(date, ref, scope) {
+    return scope === "week"
+      ? date.hasSame(ref, "week")
+      : date.hasSame(ref, "month");
+  }
 
-      let hslMatch = color.match(/hsla?\(\s*([^)]+)\)/);
-      if (hslMatch) {
-        let content = hslMatch[1].trim();
-        let parts;
+  function format(date, options = { month: "numeric", day: "numeric" }) {
+    const dateFormat = new Intl.DateTimeFormat("es-ES", options);
+    return dateFormat.format(date);
+  }
+  function handleBirthdays(dateStr, ref) {
+    const date = DateTime.fromISO(dateStr);
+    const currentYear = ref.year;
+    const birthday = DateTime.fromObject({
+      year: currentYear,
+      month: date.month,
+      day: date.day,
+    });
+    return birthday;
+  }
+  function weekIndexer(date) {
+    return `${date.weekYear}${date.weekNumber}`;
+  }
+  /** devuelve una fecha en formato YYYYMM para indexar en diccionario*/
+  function monthIndexer(date) {
+    if (date.month.toString().length === 1) {
+      return `${date.year}0${date.month}`;
+    } else {
+      return `${date.year}${date.month}`;
+    }
+  }
 
-        if (content.includes("/")) {
-          parts = content.split("/").map((p) => p.trim());
-          let [hsl, a] = parts;
-          let hslParts = hsl.split(/\s+/);
-          if (hslParts.length === 3) {
-            const [h, s, l] = hslParts;
-            return `hsla(${h}, ${s}, ${l}, ${opacity})`;
-          }
-        } else {
-          parts = content.split(",").map((p) => p.trim());
-          if (parts.length >= 3) {
-            const [h, s, l] = parts;
-            return `hsla(${h}, ${s}, ${l}, ${opacity})`;
-          }
-        }
-      }
+  function parseBirthdayNote(name, alias) {
+    let text = "Cumple de ";
+    if (alias && alias.length) {
+      text += alias[0];
+    } else {
+      text += name.split(" ")[0];
+    }
+    return text;
+  }
+  /* leaves undesired characters, such as hyperlinks urls or wikilinks structure */
+  function parseEvent(text) {
+    // quitar [[foo bar| foo]] => foo
+    return text.replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g, "$1");
+  }
 
-      return color;
-    },
-  };
+  /*
+   *
+   * Parsers
+   *
+   */
 
-  const palette = [
-    ThemeUtils.themeColor("--color-blue"),
-    ThemeUtils.themeColor("--color-cyan"),
-    ThemeUtils.themeColor("--color-green"),
-    ThemeUtils.themeColor("--color-yellow"),
-    ThemeUtils.themeColor("--color-orange"),
-    ThemeUtils.themeColor("--color-red"),
-    ThemeUtils.themeColor("--color-purple"),
-    ThemeUtils.themeColor("--color-pink"),
-  ];
-
-  const InterfaceUtils = {
-    append(cl, css, parent, header = null) {
-      cl.className = css;
-      if (header) parent.appendChild(TextUtils.createHeader(header));
-      parent.appendChild(cl);
-    },
-    buttonFactory() {},
-  };
-  const TextUtils = {
-    /*
-     * devuelve el texto formateado para el calendario "Cumple de (nombre propio|primer alias)"
-     * */
-    parseBirthdayNote(name, alias) {
-      let text = "Cumple de ";
-      if (alias && alias.length) {
-        text += alias[0];
-      } else {
-        text += name.split(" ")[0];
-      }
-      return text;
-    },
-    // leaves undesired characters
-    parseEvent(text) {
-      // quitar [[foo bar| foo]] => foo
-      return text.replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g, "$1");
-    },
-    createHeader(text) {
-      const el = document.createElement("h1");
-      el.textContent = text;
-      return el;
-    },
-    firstTag(array) {
-      const tag = array[0];
-      return tag.substring(1);
-    },
-  };
-
-  const DateUtils = {
-    /**
-     * devuelve una semana entera de lunes a domingo dado un día
-     **/
-    daysOfWeek(ref) {
-      const start = ref.startOf("week");
-      return Array.from({ length: 7 }, (_, i) => start.plus({ days: i }));
-    },
-
-    /**
-     *  devuelve todas las semanas de lunes a domingo que incluyen al mes dado un día
-     *  de esta forma, puede agregar parte del mes anterior o pasado para completar la semana
-     *  util para vistas de calendario
-     **/
-    weeksOfMonth(ref) {
-      const start = ref.startOf("month").startOf("week");
-      const end = ref.endOf("month").endOf("week");
-      let cur = start;
-      const weeks = [];
-      while (cur <= end) {
-        weeks.push(this.daysOfWeek(cur));
-        cur = cur.plus({ weeks: 1 });
-      }
-      return weeks;
-    },
-
-    /**
-     * devuelve un array con todo el mes dada una fecha
-     **/
-    daysOfMonth(ref) {
-      return Array.from({ length: ref.daysInMonth }, (_, i) =>
-        ref.startOf("month").plus({ days: i }),
-      );
-    },
-
-    /*
-     * comprueba si la fecha dada está dentro del alcance de la vista,
-     * true si esta dentro del alcance, false caso contrario
-     * */
-    inScope(date, ref, scope) {
-      return scope === "week"
-        ? date.hasSame(ref, "week")
-        : date.hasSame(ref, "month");
-    },
-
-    format(date, options = { month: "numeric", day: "numeric" }) {
-      const dateFormat = new Intl.DateTimeFormat("es-ES", options);
-      return dateFormat.format(date);
-    },
-    handleBirthdays(dateStr, ref) {
-      const date = DateTime.fromISO(dateStr);
-      const currentYear = ref.year;
-      const birthday = DateTime.fromObject({
-        year: currentYear,
-        month: date.month,
-        day: date.day,
-      });
-      return birthday;
-    },
-    weekIndexer(date) {
-      return `${date.weekYear}${date.weekNumber}`;
-    },
-    monthIndexer(date) {
-      if (date.month.toString().length === 1) {
-        return `${date.year}0${date.month}`;
-      } else {
-        return `${date.year}${date.month}`;
-      }
-    },
-  };
+  function parsePath(path) {
+    const start = path.lastIndexOf("/") + 1;
+    const end = path.lastIndexOf(".md");
+    if (start === 0 || end === -1 || end <= start) return null;
+    return path.slice(start, end);
+  }
 
   class Paginator {
     constructor(pageSize = 10) {
@@ -334,64 +535,157 @@ try {
 
   /* ========== apartado QUERY ========== */
   class DataRepository {
-    constructor(dv) {
-      this.dv = dv;
-    }
+    fetch() {
+      let financesAll, projectsAll;
+      if (!globalCache.init) {
+        projectsAll = dv.pages('"projects"').file;
+      }
 
-    fetch(ref, scope) {
-      const pages = this.dv.pages();
-
-      const journal = pages
+      financesAll = dv
+        .pages('"journal"')
         .where(
-          (p) =>
-            p.file.folder && p.file.folder.includes("journal") && p.file.day,
-        )
-        .where((p) =>
-          scope === "week"
-            ? p.file.day.hasSame(ref, "week")
-            : p.file.day.hasSame(ref, "month"),
-        )
-        .file.array();
-
-      const projects = pages
-        .where((p) => p.file.folder && p.file.folder.includes("projects"))
-        .file.array();
-
-      const birthdays = pages
-        .where((p) => p.file.folder && p.file.folder.includes("personas"))
-        .file.array();
-
-      const finance = {
-        movements: [], // histórico ordenable
-        byMonth: {},
-        byDay: {}, // acceso directo por día
-        debts: { cobrar: [], pagar: [] },
-      };
-      const moneyRegex = /([+-]?\d+(?:[.,]\d+)?).*?#([\p{L}\w-]+)/u;
-      const movements = pages
-        .where(
-          (p) =>
-            p.file.folder && p.file.folder.includes("journal") && p.file.day,
+          (p) => p.file.day && p.file.day.hasSame(globalCache.ref, "month"),
         )
         .file.lists.filter((item) =>
           item.header?.toString().toLowerCase().includes("gastos"),
         );
+      const journalAll = dv
+        .pages('"journal"')
+        .where((p) =>
+          p.file.day && globalCache.scope === "week"
+            ? p.file.day.hasSame(globalCache.ref, "week")
+            : p.file.day.hasSame(globalCache.ref, "month"),
+        )
+        .file.array();
 
-      for (const item of movements) {
+      const birthdaysAll = dv
+        .pages()
+        .where((p) => p.file.folder && p.file.folder.includes("personas"))
+        .file.array();
+
+      return { journalAll, birthdaysAll, projectsAll, financesAll };
+    }
+  }
+
+  function indexGlobal(projectsAll) {
+    // proyectos
+    let projectStatus = "Active";
+    for (const t of projectsAll.tasks.array()) {
+      const h = t.header?.toString().toLowerCase();
+      if (!h || (h.includes("waiting") && !t.completed)) {
+        projectStatus = "Waiting";
+        break;
+      }
+      if (!h || !h.includes("next actions")) continue;
+
+      const name = parsePath(t.path); // o tu función para obtener proyecto
+      const p = (globalCache.projects[name] ??= { total: 0, done: 0 });
+
+      p.total++;
+      if (t.completed) p.done++;
+    }
+    for (const k in globalCache.projects) {
+      const p = globalCache.projects[k];
+      p.completion = p.total ? p.done / p.total : 0;
+      if (p.total === p.done) {
+        projectStatus = "Finished";
+      }
+      if (p.total === 0) {
+        projectStatus = "Empty";
+      }
+      p.projectStatus = projectStatus;
+    }
+    globalCache.paginator.pageSize = Object.keys(globalCache.projects).length;
+  }
+
+  async function indexScoped(
+    birthdaysAll,
+    journalAll,
+    financesAll,
+    scope,
+    ref,
+  ) {
+    for (const file of journalAll) {
+      const day = ensureDay(file.day);
+      day.page = file;
+
+      for (const item of file.lists) {
+        const header = item.header?.toString().toLowerCase() ?? "";
+
+        if (header.includes("habits") && inScope(file.day, ref, scope)) {
+          day.habits[item.text] = item.completed;
+          globalCache.habits.add(item.text);
+        }
+
+        if (header.includes("planes")) {
+          day.events.push({
+            text: parseEvent(item.text),
+            isBirthday: false,
+          });
+        }
+      }
+    }
+
+    // birthdays
+    for (const b of birthdaysAll) {
+      const date = handleBirthdays(b.frontmatter.birth, ref);
+      if (!inScope(date, ref, scope)) continue;
+
+      const day = ensureDay(date);
+      day.events.push({
+        text: parseBirthdayNote(b.name, b.aliases),
+        isBirthday: true,
+      });
+    }
+
+    // health series
+    const days = scope === "week" ? daysOfWeek(ref) : daysOfMonth(ref);
+
+    for (const day of days) {
+      const entry = ensureDay(day);
+      const page = entry.page;
+      const date = day.toFormat("dd");
+      globalCache.healthIndex.days.push(date);
+
+      let hours = null;
+      let quality = null;
+      let water = null;
+
+      if (page) {
+        const p = page.frontmatter;
+
+        if (p.waketime || p.bedtime || p.sleepQuality || p.waterIntake)
+          globalCache.healthIndex.isEmpty = false;
+        if (p.waketime && p.bedtime) hours = diffHours(p.waketime, p.bedtime);
+        if (p.sleepQuality) quality = Number(p.sleepQuality);
+        if (p.waterIntake) water = Number(p.waterIntake);
+      }
+
+      globalCache.healthIndex.quality.push(quality);
+      globalCache.healthIndex.water.push(water);
+      globalCache.healthIndex.hours.push(hours);
+    }
+
+    let checkpoints;
+    if (json) {
+      checkpoints = JSON.parse(json);
+      let snapshot = checkpoints[monthIndexer(globalCache.ref)];
+
+      const specialSet = new Set(Object.keys(specialHandlers));
+
+      for (const item of financesAll) {
         const m = item.text.match(moneyRegex);
         if (!m) continue;
         const raw = Number(m[1].replace(",", "."));
         if (Number.isNaN(raw)) continue;
 
         const tags = item.tags ?? [];
-        const iso = item.path.replace(/^.*\/(\d{4}-\d{2}-\d{2})\.md$/, "$1");
+        const iso = parsePath(item.path);
         const date = item.task ? item.completion : DateTime.fromISO(iso);
 
-        const specialSet = new Set(Object.keys(specialHandlers));
-
-        let category = null;
-        let handler = null;
-        let deltas = null;
+        let category = null,
+          handler = null,
+          deltas = null;
 
         for (const t of tags) {
           const h = specialHandlers[t];
@@ -405,13 +699,35 @@ try {
         }
 
         if (handler) {
-          deltas = handler(raw, category, item.completed, item, finance);
+          deltas = handler(raw, category, item.completed, item);
         } else {
           deltas = handlers["default"](raw, category);
         }
 
-        // si es una deuda pendiente, no agregar
-        if (!deltas) continue;
+        if (!deltas)
+          // si es una deuda pendiente, no agregar
+          continue;
+
+        if (inScope(date, globalCache.ref, globalCache.scope)) {
+          if (raw >= 0) {
+            globalCache.finance.scoped.income += raw;
+          } else {
+            globalCache.finance.scoped.expense += Math.abs(raw);
+            if (deltas.cat) {
+              globalCache.finance.scoped.byCategory[deltas.cat] ??= [];
+              globalCache.finance.scoped.byCategory[deltas.cat] +=
+                Math.abs(raw);
+            }
+            if (deltas.type === "efectivo") {
+              globalCache.finance.scoped.cash += Math.abs(raw);
+            }
+            if (deltas.type === "cuenta corriente") {
+              globalCache.finance.scoped.card += Math.abs(raw);
+            }
+          }
+        }
+        // calcular snapshot
+        snapshot = calcSnapshotAtMovement(deltas, snapshot);
 
         const movInScope = {
           date,
@@ -423,317 +739,215 @@ try {
           savingsDelta: deltas.savings,
           cashDelta: deltas.cash,
           cardDelta: deltas.card,
+          snapshot,
         };
 
-        const month = DateUtils.monthIndexer(date);
+        const month = monthIndexer(date);
 
-        finance.movements.push(movInScope);
-        finance.byMonth[month] ??= [];
-        finance.byMonth[month].push(movInScope);
-        finance.byDay[iso] ??= [];
-        finance.byDay[iso].push(movInScope);
+        globalCache.finance.byMonth[month] ??= [];
+        globalCache.finance.byMonth[month].push(movInScope);
       }
-
-      return { journal, projects, birthdays, finance };
+      // poner los ultimos
+      globalCache.finance.scoped.snapshot = snapshot;
     }
   }
 
-  /* ========== INDEXADOR ========== */
-  async function indexData(
-    { journal, projects, birthdays, finance },
-    ref,
-    scope,
-  ) {
-    const pageByDay = {};
-    const weeks = {};
-    const habitsSet = new Set();
-    const projectRecords = [];
-    const healthSeries = {
-      isEmpty: true,
-      labels: [],
-      quality: [],
-      water: [],
-      hours: [],
-    };
-
-    function ensureDay(date) {
-      const iso = date.toISODate();
-      const w = DateUtils.weekIndexer(date);
-      weeks[w] ??= { days: {} };
-      weeks[w].days[iso] ??= { habits: {}, events: [] };
-      return weeks[w].days[iso];
+  /* indexa todas las entradas necesarias en la GlobalCache */
+  async function index({ projectsAll, birthdaysAll, journalAll, financesAll }) {
+    if (!globalCache.init) {
+      indexGlobal(projectsAll);
     }
-
-    // projects WARNING TODO check: no debería recargarse con el rerender, ya que es global
-    for (const file of projects) {
-      let projectStatus = "Active";
-      let completion = 0;
-      let size = 0;
-      let done = 0;
-
-      for (const t of file.tasks) {
-        const h = t.header?.toString().toLowerCase() ?? "";
-
-        if (h.includes("next actions")) {
-          if (t.completed) done++;
-          size++;
-        }
-
-        if (h.includes("waiting") && !t.completed) {
-          projectStatus = "Waiting";
-        }
-      }
-
-      if (size === 0) {
-        projectStatus = "Empty";
-        completion = 0;
-      } else {
-        completion = done / size;
-      }
-
-      if (completion === 1) projectStatus = "done";
-
-      projectRecords.push({
-        file,
-        completion,
-        status: projectStatus,
-      });
-    }
-
-    // journal
-    for (const file of journal) {
-      const iso = file.day.toISODate();
-      pageByDay[iso] = file;
-
-      const day = ensureDay(file.day);
-
-      for (const item of file.lists) {
-        const header = item.header?.toString().toLowerCase() ?? "";
-
-        if (
-          header.includes("habits") &&
-          DateUtils.inScope(file.day, ref, scope)
-        ) {
-          day.habits[item.text] = item.completed;
-          habitsSet.add(item.text);
-        }
-
-        if (header.includes("planes")) {
-          day.events.push({
-            text: TextUtils.parseEvent(item.text),
-            isBirthday: false,
-          });
-        }
-      }
-    }
-
-    // birthdays
-    for (const b of birthdays) {
-      const date = DateUtils.handleBirthdays(b.frontmatter.birth, ref);
-      if (!DateUtils.inScope(date, ref, scope)) continue;
-
-      const day = ensureDay(date);
-      day.events.push({
-        text: TextUtils.parseBirthdayNote(b.name, b.aliases),
-        isBirthday: true,
-      });
-    }
-
-    // health series
-    const days =
-      scope === "week" ? DateUtils.daysOfWeek(ref) : DateUtils.daysOfMonth(ref);
-
-    for (const day of days) {
-      const iso = day.toISODate();
-      const page = pageByDay[iso];
-      const label = day.toFormat("dd");
-
-      let hours = 0;
-      let quality = null;
-      let water = null;
-
-      if (
-        page &&
-        page.frontmatter.waketime &&
-        page.frontmatter.bedtime &&
-        day.month === ref.month
-      ) {
-        const p = page.frontmatter;
-        hours = DateTime.fromISO(p.waketime)
-          .diff(DateTime.fromISO(p.bedtime))
-          .as("hours");
-        quality = p.sleepQuality ? Number(p.sleepQuality) : 0;
-        water = p.waterIntake ? Number(p.waterIntake) : 0;
-        healthSeries.isEmpty = false;
-      }
-
-      healthSeries.labels.push(label);
-      healthSeries.quality.push(quality);
-      healthSeries.water.push(water);
-      healthSeries.hours.push(hours);
-    }
-
-    // detalle de cada transaccion
-    const financeScope = [];
-    financeScope.expenseByCategory = {};
-    ((financeScope.incomeScope = 0),
-      (financeScope.expenseScope = 0),
-      (financeScope.gastoTarjeta = 0),
-      (financeScope.gastoEfectivo = 0));
-
-    let movsFromCheckpoint,
-      cardSnapshot,
-      cashSnapshot,
-      availableSnapshot,
-      savingsSnapshot;
-
-    // desde checkpoint si existe
-    if (finance.byMonth[DateUtils.monthIndexer(ref)] !== undefined) {
-      movsFromCheckpoint = finance.byMonth[DateUtils.monthIndexer(ref)];
-      const check = await checkpoint(DateUtils.monthIndexer(ref));
-      cardSnapshot = Number(check.card);
-      cashSnapshot = Number(check.cash);
-      availableSnapshot = Number(check.available);
-      savingsSnapshot = Number(check.savings);
-    } else {
-      movsFromCheckpoint = finance.movements;
-      cardSnapshot = CONFIG.INITIAL_MONEY;
-      cashSnapshot = CONFIG.INITIAL_CASH;
-      availableSnapshot = CONFIG.INITIAL_CASH + CONFIG.INITIAL_MONEY;
-      savingsSnapshot = CONFIG.INITIAL_SAVINGS;
-    }
-
-    for (const m of movsFromCheckpoint) {
-      cardSnapshot += m.cardDelta;
-      cashSnapshot += m.cashDelta;
-      availableSnapshot += m.cashDelta + m.cardDelta;
-      savingsSnapshot += m.savingsDelta;
-      const newCat = m.cat ? m.cat : m.type;
-
-      if (
-        DateUtils.inScope(m.date, state.ref, state.scope) &&
-        m.type !== "ahorro" &&
-        m.type !== "reintegro" &&
-        m.raw < 0
-      ) {
-        financeScope.expenseByCategory[newCat] ??= 0;
-        financeScope.expenseByCategory[newCat] += Math.abs(m.raw);
-      }
-
-      // solo sumar ingresos/gastos al scope para resumen
-      if (
-        DateUtils.inScope(m.date, state.ref, state.scope) &&
-        m.type !== "ahorro" &&
-        m.type !== "reintegro"
-      ) {
-        if (m.raw >= 0) financeScope.incomeScope += m.raw;
-        else {
-          financeScope.expenseScope += Math.abs(m.raw);
-          if (m.type === "efectivo") {
-            financeScope.gastoEfectivo += Math.abs(m.raw);
-          } else {
-            financeScope.gastoTarjeta += Math.abs(m.raw);
-          }
-        }
-      }
-
-      if (DateUtils.inScope(m.date, state.ref, state.scope)) {
-        financeScope.push({
-          date: m.date,
-          text: m.text,
-          cat: newCat,
-          movementDetail: m.raw,
-          cashSnapshot: cashSnapshot.toFixed(2),
-          cardSnapshot: cardSnapshot.toFixed(2),
-          availableSnapshot: availableSnapshot.toFixed(2),
-        });
-      }
-    }
-    console.log(financeScope);
-    financeScope.savingsSnapshot = savingsSnapshot.toFixed(2);
-    financeScope.availableSnapshot = availableSnapshot.toFixed(2);
-
-    return {
-      weeks,
-      pageByDay,
-      habitsSet,
-      projectRecords,
-      healthSeries,
-      financeScope,
-    };
+    await indexScoped(
+      birthdaysAll,
+      journalAll,
+      financesAll,
+      globalCache.scope,
+      globalCache.ref,
+    );
   }
 
-  /* ========== UI: elementos base ========== */
+  /* UI renderizacion */
   const root = dv.container;
-  root.innerHTML = "";
+  root.textContent = "";
+
   const projectsCanvas = document.createElement("div");
   projectsCanvas.className = "project-canvas";
-  root.appendChild(projectsCanvas);
 
   const controls = document.createElement("div");
   controls.className = "dashboard-controls";
 
   const scopeSelect = document.createElement("select");
   scopeSelect.innerHTML = `<option value="week">semanal</option><option value="month">mensual</option>`;
-  scopeSelect.value = state.scope;
 
   const navPrev = document.createElement("button");
+  navPrev.dataset.nav = "prev";
   navPrev.textContent = "◀";
 
   const navLabel = document.createElement("span");
   navLabel.className = "nav-label";
 
   const navNext = document.createElement("button");
+  navNext.dataset.nav = "next";
   navNext.textContent = "▶";
 
   controls.append(scopeSelect, navPrev, navLabel, navNext);
-  root.appendChild(controls);
 
-  const tableDiv = document.createElement("div");
-  InterfaceUtils.append(tableDiv, "calendar-wrap", root, "Calendario");
+  const calendarSpace = document.createElement("div");
+  calendarSpace.className = "calendar-wrap";
 
   const sleepSpace = document.createElement("div");
-  root.appendChild(sleepSpace);
+  navPrev.dataset.nav = "prev";
+  const financeSpace = document.createElement("div");
+  navLabel.className = "nav-label";
+  financeSpace.className = "finance-wrap";
 
-  const financeDiv = document.createElement("div");
-  InterfaceUtils.append(financeDiv, "finance-wrap", root);
-  financeDiv.className = "finance-wrap";
+  let sleepChart, expenseChart, financeChart;
+  root.append(
+    projectsCanvas,
+    controls,
+    calendarSpace,
+    sleepSpace,
+    financeSpace,
+  );
 
-  const expenseChartDiv = document.createElement("div");
-  expenseChartDiv.className = "expense-wrap";
-  root.appendChild(expenseChartDiv);
+  const projectCardTemplate = (() => {
+    const card = document.createElement("div");
+    card.className = "project-card";
 
-  let sleepChart = null,
-    financeChart = null,
-    expenseChart = null;
+    let title = document.createElement("span");
+    title.className = "project-title";
 
-  /* ========== Estado de datos y paginator único para secciones grandes ========== */
-  const repo = new DataRepository(dv);
-  let indexed = null;
+    let status = document.createElement("div");
 
-  /* ========== FETCH + INDEX (se re-evalúa en cada cambio de state) ========== */
-  async function refreshData() {
-    const { ref, scope } = state;
-    const raw = repo.fetch(ref, scope);
-    return indexData(raw, ref, scope);
+    let bar = document.createElement("progress");
+
+    card.append(title, bar, status);
+    return card;
+  })();
+
+  function getProjectsArray() {
+    return Object.entries(globalCache.projects);
   }
 
-  /* ========== RENDER: tabla de calendario basada en indexed y DateUtils ========== */
-  function renderTable() {
-    tableDiv.innerHTML = "";
-    const { ref, scope } = state;
+  function getTotalPages(items) {
+    return Math.ceil(items.length / globalCache.paginator.pageSize);
+  }
+
+  function paginate(items) {
+    const start = globalCache.paginator.page * globalCache.paginator.pageSize;
+    return items.slice(start, start + globalCache.paginator.pageSize);
+  }
+
+  function renderProjects() {
+    const items = getProjectsArray();
+    const totalPages = getTotalPages(items);
+
+    const frag = document.createDocumentFragment();
+
+    // controls
+    const controls = document.createElement("div");
+    controls.className = "dashboard-controls";
+
+    const prev = document.createElement("button");
+    prev.className = "prevButton";
+    prev.textContent = "◀";
+    prev.disabled = globalCache.paginator.page === 0;
+
+    const label = document.createElement("span");
+    label.textContent = `${globalCache.paginator.page + 1} / ${totalPages}`;
+
+    const next = document.createElement("button");
+    next.className = "nextButton";
+    next.textContent = "▶";
+    next.disabled = globalCache.paginator.page >= totalPages - 1;
+
+    controls.append(prev, label, next);
+
+    controls.addEventListener("click", (event) => {
+      if (
+        event.target.closest(".prevButton") &&
+        globalCache.paginator.page > 0
+      ) {
+        globalCache.paginator.page--;
+        renderProjects();
+      }
+
+      if (
+        event.target.closest(".nextButton") &&
+        globalCache.paginator.page < totalPages - 1
+      ) {
+        globalCache.paginator.page++;
+        renderProjects();
+      }
+    });
+
+    // cards
+    const cards = document.createElement("div");
+    cards.className = "projects-page";
+
+    const pageItems = paginate(items);
+
+    for (const [name, p] of pageItems) {
+      const card = projectCardTemplate.cloneNode(true);
+
+      const title = card.children[0];
+      const bar = card.children[1];
+      const status = card.children[2];
+
+      title.textContent = name;
+      bar.title = `Completado ${p.completion.toFixed(2) * 100}%`;
+      bar.value = p.done || 0;
+      bar.max = p.total || 1;
+      status.textContent = p.projectStatus;
+
+      cards.appendChild(card);
+    }
+
+    frag.append(controls, cards);
+    projectsCanvas.replaceChildren(frag);
+  }
+
+  function renderPaginator() {
     navLabel.textContent =
-      scope === "week"
-        ? `semana ${ref.weekNumber} · ${ref.year}`
-        : ref.toFormat("LLLL yyyy");
+      globalCache.scope === "week"
+        ? `semana ${globalCache.ref.weekNumber} · ${globalCache.ref.year}`
+        : globalCache.ref.toFormat("LLLL yyyy");
+  }
 
+  /** abre el archivo recibido, y lo crea en caso de no existir, por defecto crea una pagina de journal */
+  async function openOrCreateFile(
+    f,
+    temp = "templates/Daily.md",
+    dest = "journal",
+  ) {
+    const path = `${dest}/${f}.md`;
+    let file = app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      const templater = app.plugins.plugins["templater-obsidian"];
+      const template = app.vault.getAbstractFileByPath(temp);
+      if (templater && template)
+        await templater.templater.create_new_note_from_template(
+          template,
+          dest,
+          f,
+        );
+      else await app.vault.create(path, "");
+      file = app.vault.getAbstractFileByPath(path);
+    }
+    app.workspace.getLeaf().openFile(file);
+  }
+
+  function renderCalendar() {
+    // crear una tabla
     const table = document.createElement("table");
-    table.className = "calendar-table";
 
-    // header row
+    // anyadir los dias de la semana
     const headerRow = document.createElement("tr");
-    headerRow.appendChild(document.createElement("th"));
-    headerRow.className = "current-month";
+    const month = document.createElement("tr");
+    month.className = "month-link";
+    month.dataset.iso = `${globalCache.ref.toFormat("yyyy-MM")}`;
+    month.textContent = `${globalCache.ref.toFormat("LLLL")}`;
+    headerRow.appendChild(month);
     CONFIG.WEEKDAYS.forEach((w) => {
       const th = document.createElement("th");
       th.textContent = w;
@@ -741,74 +955,99 @@ try {
     });
     table.appendChild(headerRow);
 
-    const weeksToRender =
-      scope === "week"
-        ? [DateUtils.daysOfWeek(ref)]
-        : DateUtils.weeksOfMonth(ref);
+    function createDayCell(day) {
+      const td = document.createElement("td");
+      if (globalCache.scope === "month") {
+        td.className =
+          day.month === globalCache.ref.month ? "current-month" : "other-month";
+      } else {
+        td.className = "current-month";
+      }
 
+      const span = document.createElement("span");
+      span.className = "day-link";
+      span.dataset.iso = day.toISODate();
+      span.textContent = day.day;
+
+      td.appendChild(span);
+      return td;
+    }
+
+    function createPlanCell(day, weekIndex) {
+      const td = document.createElement("td");
+      const iso = day.toISODate();
+      const events = weekIndex[iso]?.events ?? [];
+      td.className = "plain-cell";
+
+      if (events.length && day.month === globalCache.ref.month) {
+        td.className = "plan-cell";
+        const hasBirthday = events.some((e) => e.isBirthday);
+        const hasPlan = events.some((e) => !e.isBirthday);
+        td.textContent = hasBirthday ? "🎂" : hasPlan ? "🗓️" : "";
+        td.title = events.map((e) => e.text).join("\n");
+      }
+
+      return td;
+    }
+
+    /** Renderiza los habitos de una semana en la tabla */
+    function createHabitRow(habit, week, weekIndex) {
+      const tr = document.createElement("tr");
+      const htd = document.createElement("td");
+      htd.textContent = habit;
+      tr.appendChild(htd);
+
+      const todayISO = DateTime.now().toISODate();
+
+      for (const d of week) {
+        const td = document.createElement("td");
+        td.className = "plain-cell";
+        const iso = d.toISODate();
+        const done = weekIndex[iso]?.habits?.[habit];
+
+        if (iso > todayISO || weekIndex[iso] === undefined)
+          td.textContent = " ";
+        else if (done === undefined) td.textContent = "—";
+        else td.textContent = done ? "✔" : "✘";
+
+        tr.appendChild(td);
+      }
+
+      return tr;
+    }
+
+    // recalcular el scope
+    const weeksToRender =
+      globalCache.scope === "week"
+        ? [daysOfWeek(globalCache.ref)]
+        : weeksOfMonth(globalCache.ref);
+
+    // por cada semana
     for (const week of weeksToRender) {
-      // cache de la semana indexada (una vez por semana)
-      const isoWeek = DateUtils.weekIndexer(week[0]);
-      const weekIndex = indexed.weeks?.[isoWeek]?.days ?? {};
+      // obtener la semana y consultar el weekIndex
+      const isoWeek = weekIndexer(week[0]);
+      const weekIndex = globalCache.weeks?.[isoWeek]?.days ?? {};
 
       // day numbers row
       const dayRow = document.createElement("tr");
-      dayRow.className = "current-month";
-      dayRow.appendChild(document.createElement("td"));
-      for (const d of week) {
-        const td = document.createElement("td");
-        const iso = d.toISODate();
-        const link = document.createElement("span");
-        link.className = "day-link";
-        link.textContent = d.day;
-        link.onclick = async () => {
-          const path = `journal/${iso}.md`;
-          let file = app.vault.getAbstractFileByPath(path);
-          if (!file) {
-            const templater = app.plugins.plugins["templater-obsidian"];
-            const template =
-              app.vault.getAbstractFileByPath("templates/Daily.md");
-            if (templater && template)
-              await templater.templater.create_new_note_from_template(
-                template,
-                "journal",
-                iso,
-              );
-            else await app.vault.create(path, "");
-            file = app.vault.getAbstractFileByPath(path);
-          }
-          app.workspace.getLeaf().openFile(file);
-        };
-        td.appendChild(link);
-        td.className = d.month === ref.month ? "current-month" : "other-month";
-        dayRow.appendChild(td);
-      }
-      table.appendChild(dayRow);
+      const weekLink = document.createElement("tr");
+      weekLink.className = "week-link";
+      // TODO cambiar esto para que pueda ser seleccionado desde el plugin de periodic reviews
+      weekLink.dataset.iso = `${week[0].toFormat("kkkk-MM-'W'WW")}`;
+      weekLink.textContent = `${week[0].toFormat("'W'WW")}`;
+      dayRow.appendChild(weekLink);
 
+      // plan row
       const planRow = document.createElement("tr");
       const pl = document.createElement("td");
-      pl.className = "plan-cell";
+      pl.className = "current-month";
       pl.textContent = "planes";
       planRow.appendChild(pl);
-
       for (const d of week) {
-        const td = document.createElement("td");
-        const iso = d.toISODate();
-        const events = weekIndex[iso]?.events ?? [];
-
-        if (events.length && d.month === ref.month) {
-          td.className = "plan-cell";
-          const hasBirthday = events.some((e) => e.isBirthday);
-          const hasPlan = events.some((e) => !e.isBirthday);
-
-          if (hasBirthday) td.textContent = "🎂";
-          else if (hasPlan) td.textContent = "🗓️";
-
-          td.title = events.map((e) => e.text).join("\n");
-        }
-
-        planRow.appendChild(td);
+        dayRow.appendChild(createDayCell(d));
+        planRow.appendChild(createPlanCell(d, weekIndex));
       }
+      table.appendChild(dayRow);
       table.appendChild(planRow);
 
       // habits rows (solo hábitos presentes en esta semana)
@@ -820,155 +1059,57 @@ try {
       }
 
       for (const habit of habitsInWeek) {
-        const tr = document.createElement("tr");
-        const htd = document.createElement("td");
-        const todayISO = DateTime.now().toISODate();
-        htd.className = "plan-cell";
-        htd.textContent = habit;
-        tr.appendChild(htd);
-
-        for (const d of week) {
-          const td = document.createElement("td");
-          const iso = d.toISODate();
-          const done = weekIndex[iso]?.habits?.[habit];
-
-          if (iso > todayISO || weekIndex[iso] === undefined) {
-            td.textContent = " ";
-          } else if (done === undefined) {
-            td.textContent = "—";
-          } else {
-            td.textContent = done ? "✔" : "✘";
-          }
-
-          tr.appendChild(td);
-        }
-
-        table.appendChild(tr);
+        table.appendChild(createHabitRow(habit, week, weekIndex));
       }
     }
 
-    tableDiv.appendChild(table);
-  }
+    table.addEventListener("click", (event) => {
+      const target = event.target;
 
-  /* ========== RENDER PROJECTS (paginado con projectsPaginator) ========== */
-  const projectsPaginator = new Paginator(CONFIG.PROJECTS_PAGE_SIZE);
-  function renderProjects(projects) {
-    projectsCanvas.innerHTML = "";
-
-    const projectControls = document.createElement("grid");
-
-    const projPrev = document.createElement("button");
-    projPrev.textContent = "◀";
-
-    const projLabel = document.createElement("span");
-    projLabel.className = "nav-label";
-    projLabel.textContent = `${projectsPaginator.page}/${projectsPaginator.pages()}`;
-
-    const projNext = document.createElement("button");
-    projNext.textContent = "▶";
-
-    projectControls.append(
-      TextUtils.createHeader("Proyectos"),
-      projPrev,
-      projLabel,
-      projNext,
-    );
-    projectsCanvas.appendChild(projectControls);
-
-    projectsCanvas.appendChild(document.createElement("div"));
-
-    const cardsContainer = document.createElement("div");
-    cardsContainer.className = "projects-page";
-    projectsCanvas.appendChild(cardsContainer);
-
-    function renderPage() {
-      cardsContainer.innerHTML = "";
-
-      const pageItems = projectsPaginator.slice(projects);
-      const totalPages = projectsPaginator.pages(projects.length);
-
-      projLabel.textContent = `${projectsPaginator.page + 1}/${totalPages}`;
-
-      for (const r of pageItems) {
-        const card = document.createElement("div");
-        card.className = "project-card";
-
-        const title = document.createElement("span");
-        title.className = "project-title";
-        title.textContent = r.file.name;
-        title.onclick = async () => {
-          const file = app.vault.getAbstractFileByPath(r.file.path);
-          app.workspace.getLeaf().openFile(file);
-        };
-
-        const percent = document.createElement("div");
-        percent.className = "project-percent";
-        percent.textContent = `Completion: ${Math.round(r.completion * 100)}%`;
-
-        const status = document.createElement("div");
-        status.className = "project-status";
-        status.textContent = `Status: ${r.status}`;
-
-        card.append(title, percent, status);
-        cardsContainer.appendChild(card);
+      if (target.className.toLowerCase() === "day-link") {
+        openOrCreateFile(target.dataset.iso);
       }
-
-      projPrev.disabled = projectsPaginator.page === 0;
-      projNext.disabled = projectsPaginator.page >= totalPages - 1;
-    }
-
-    projPrev.onclick = () => {
-      projectsPaginator.prev();
-      renderPage();
-    };
-
-    projNext.onclick = () => {
-      projectsPaginator.next(projects.length);
-      renderPage();
-    };
-
-    renderPage();
+      if (target.className.toLowerCase() === "month-link") {
+        openOrCreateFile(target.dataset.iso, "templates/Monthly.md", "reviews");
+      }
+      if (target.className.toLowerCase() === "week-link") {
+        openOrCreateFile(target.dataset.iso, "templates/Weekly.md", "reviews");
+      }
+    });
+    calendarSpace.appendChild(table);
   }
 
-  /* ========== SLEEP CHART RENDER ========== */
-  function renderHealth(rec) {
-    sleepSpace.innerHTML = "";
+  function renderHealth() {
     sleepChart?.destroy();
-    if (!rec.isEmpty) {
-      const sleepCanvas = document.createElement("canvas");
-      InterfaceUtils.append(sleepCanvas, "sleep-canvas", sleepSpace, "Salud");
-      sleepChart = new Chart(sleepCanvas, {
+    sleepChart = null;
+    if (globalCache.healthIndex.isEmpty) {
+      sleepSpace.style.textAlign = "center";
+      sleepSpace.textContent = "Sin registros de salud...";
+    } else {
+      const canvas = document.createElement("canvas");
+      sleepSpace.replaceChildren(canvas);
+      sleepChart = new Chart(canvas, {
+        type: "line",
         data: {
-          labels: rec.labels,
+          labels: globalCache.healthIndex.days,
           datasets: [
             {
-              type: "line",
-              label: "calidad",
-              data: rec.quality,
+              label: "horas de sueño",
               tension: 0.3,
-              yAxisID: "yQuality",
-              borderColor: ThemeUtils.themeColor("--color-accent"),
-              backgroundColor: ThemeUtils.themeColor("--color-accent"),
-            },
-            {
-              type: "line",
-              label: "agua",
-              data: rec.water,
-              tension: 0.3,
-              yAxisID: "yQuality",
-              borderColor: ThemeUtils.themeColor("--color-blue"),
-              backgroundColor: ThemeUtils.themeColor("--color-blue"),
-            },
-            {
-              type: "bar",
-              label: "horas",
-              data: rec.hours,
+              data: globalCache.healthIndex.hours,
               yAxisID: "yHours",
-              borderColor: ThemeUtils.themeColor("--color-accent-2"),
-              borderWidth: 2,
-              backgroundColor: ThemeUtils.transparentize(
-                ThemeUtils.themeColor("--color-accent"),
-              ),
+            },
+            {
+              label: "calidad de sueño",
+              tension: 0.3,
+              data: globalCache.healthIndex.quality,
+              yAxisID: "yQuality",
+            },
+            {
+              label: "agua",
+              tension: 0.3,
+              data: globalCache.healthIndex.water,
+              yAxisID: "yQuality",
             },
           ],
         },
@@ -982,95 +1123,57 @@ try {
     }
   }
 
-  /* ========== FINANCES RENDER (repositorio + indexed) ========== */
-  function processTransaction(delta) {
-    if (delta.type !== "ahorro" || delta.type !== "reintegro") {
-      return `${Math.abs(delta.raw).toFixed(2)} ↔️`;
-    } else if (delta.raw >= 0) {
-      return `${Math.abs(delta.raw).toFixed(2)} 📈`;
-    } else {
-      return `${Math.abs(delta.raw).toFixed(2)} 📉`;
+  async function renderFinances() {
+    let mov = globalCache.finance.byMonth[monthIndexer(globalCache.ref)];
+    let total = globalCache.finance.scoped;
+
+    if (financeChart) {
+      financeChart.destroy();
+      financeChart = null;
     }
-  }
 
-  async function renderFinances(mov) {
-    financeDiv.innerHTML = "";
+    if (expenseChart) {
+      expenseChart.destroy();
+      expenseChart = null;
+    }
 
-    let pagarTotal = 0,
-      cobrarTotal = 0;
-    const moneyRegex = /([+-]?\d+(?:[.,]\d+)?).*?#([\p{L}\w-]+)/u;
+    const chartsWrap = document.createElement("div");
+    chartsWrap.className = "finance-charts";
 
-    // listar deudas pendientes
-    const cobrarTasks = dv
-      .pages()
-      .where((p) => p.file.folder.includes("journal"))
-      .file.tasks.where(
-        (t) =>
-          t.text.includes("#deuda") &&
-          !t.completed &&
-          parseFloat(t.text.match(moneyRegex)?.[1]) > 0,
+    const left = document.createElement("div");
+    left.className = "left";
+
+    const right = document.createElement("div");
+    right.className = "right";
+
+    const barCanvas = document.createElement("canvas");
+    const pieCanvas = document.createElement("canvas");
+
+    left.append(barCanvas);
+    right.append(pieCanvas);
+    chartsWrap.append(left, right);
+
+    const debtsSpace = document.createElement("div");
+    function renderDebts() {
+      const data = globalCache.finance.debts;
+      const title = document.createElement("h1");
+      title.textContent = `Deudas (-${data.totalPagar} +${data.totalCobrar})`;
+      debtsSpace.append(
+        title,
+        TaskListDOM(data.pagar),
+        TaskListDOM(data.cobrar),
       );
-
-    const pagarTasks = dv
-      .pages()
-      .where((p) => p.file.folder.includes("journal"))
-      .file.tasks.where(
-        (t) =>
-          t.text.includes("#deuda") &&
-          !t.completed &&
-          parseFloat(t.text.match(moneyRegex)?.[1]) < 0,
-      );
-
-    if (cobrarTasks.length) {
-      dv.header(2, `A cobrar (total ${cobrarTotal})`);
-      dv.taskList(cobrarTasks, false);
     }
 
-    if (pagarTasks.length) {
-      dv.header(2, `A pagar (total ${pagarTotal})`);
-      dv.taskList(pagarTasks, false);
-    }
-
-    // gráfico de finanzas
-    if (mov.expenseScope !== 0 || mov.incomeScope !== 0) {
-      financeDiv.appendChild(TextUtils.createHeader("Finanzas"));
-      const chartsWrap = document.createElement("div");
-      chartsWrap.className = "finance-charts";
-
-      const left = document.createElement("div");
-      left.className = "left";
-
-      const right = document.createElement("div");
-      right.className = "right";
-
-      chartsWrap.append(left, right);
-
-      const barCanvas = document.createElement("canvas");
-      left.append(barCanvas);
-
-      const pieCanvas = document.createElement("canvas");
-      right.append(pieCanvas);
-
-      financeDiv.appendChild(chartsWrap);
-
-      const labels = Object.keys(mov.expenseByCategory);
-      const data = Object.values(mov.expenseByCategory);
-
-      expenseChart?.destroy();
-      financeChart?.destroy();
+    function renderCategoriesGraph() {
+      const labels = Object.keys(total.byCategory);
+      const data = Object.values(total.byCategory);
 
       expenseChart = new Chart(pieCanvas, {
         type: "pie",
         data: {
           labels,
-          datasets: [
-            {
-              data,
-              backgroundColor: labels.map(
-                (_, i) => palette[i % palette.length],
-              ),
-            },
-          ],
+          datasets: [{ data }],
         },
         options: {
           layout: { padding: 0 },
@@ -1083,45 +1186,41 @@ try {
           maintainAspectRatio: false,
         },
       });
+    }
 
-      financeChart?.destroy();
+    function renderGraphBar() {
       const financesData = {
         labels: ["gasto", "ingreso", "cuentas"],
         datasets: [
           {
-            label: `Tarjeta (total ${mov.expenseScope.toFixed(2)})`,
-            data: [mov.gastoTarjeta, null, null],
+            label: `Tarjeta (total ${total.expense.toFixed(2)})`,
+            data: [total.card, null, null],
             stack: "gastos",
             yAxisID: "yMoney",
-            backgroundColor: ThemeUtils.themeColor("--color-red"),
           },
           {
-            label: `Efectivo (total ${mov.expenseScope.toFixed(2)})`,
-            data: [mov.gastoEfectivo, null, null],
+            label: `Efectivo (total ${total.expense.toFixed(2)})`,
+            data: [total.cash, null, null],
             stack: "gastos",
             yAxisID: "yMoney",
-            backgroundColor: ThemeUtils.themeColor("--color-orange"),
           },
           {
             label: "Ingresos",
-            data: [null, mov.incomeScope, null],
+            data: [null, total.income, null],
             stack: "ingresos",
             yAxisID: "yMoney",
-            backgroundColor: ThemeUtils.themeColor("--color-green"),
           },
           {
             label: "Ahorro",
-            data: [null, null, mov.savingsSnapshot],
+            data: [null, null, total.snapshot.savings],
             stack: "cuentas",
             yAxisID: "yAhorro",
-            backgroundColor: ThemeUtils.themeColor("--color-blue"),
           },
           {
             label: "Disponible",
-            data: [null, null, mov.availableSnapshot],
+            data: [null, null, total.snapshot.card + total.snapshot.cash],
             stack: "cuentas",
             yAxisID: "yAhorro",
-            backgroundColor: ThemeUtils.themeColor("--color-cyan"),
           },
           {
             label: "Meta Ahorro",
@@ -1129,7 +1228,6 @@ try {
             type: "scatter",
             yAxisID: "yAhorro",
             pointRadius: 6,
-            backgroundColor: ThemeUtils.themeColor("--color-red"),
           },
         ],
       };
@@ -1141,9 +1239,7 @@ try {
           responsive: true,
           maintainAspectRatio: false,
           layout: { padding: 0 },
-          plugins: {
-            legend: { display: false },
-          },
+          plugins: { legend: { display: false } },
           scales: {
             yMoney: {
               stacked: true,
@@ -1162,26 +1258,23 @@ try {
       });
     }
 
-    if (mov.expenseScope !== 0) {
+    function renderDetails() {
       const table = document.createElement("table");
       table.className = "finance-table";
-      table.innerHTML = `<tr class = "current-month"><th>Fecha</th><th>Movimiento</th><th>Tipo</th><th>Cantidad</th><th>Saldo</th><th>Cuenta</th><th>Efectivo</th></tr>`;
+
+      const thead = document.createElement("thead");
+      thead.innerHTML =
+        "<tr><th>Fecha</th><th>Movimiento</th><th>Monto</th><th>Saldo</th><th>Cuenta</th><th>Efectivo</th></tr>";
+
+      const tbody = document.createElement("tbody");
+      const frag = document.createDocumentFragment();
 
       for (const r of mov) {
-        if (!DateUtils.inScope(r.date, state.ref, state.scope)) continue;
-
-        const datePage = r.date.toISODate();
-        const filePath = `journal/${datePage}.md`;
-        const file = app.vault.getAbstractFileByPath(filePath);
-
-        const link = document.createElement("a");
-        link.textContent = DateUtils.format(r.date);
-        link.onclick = async () => {
-          app.workspace.getLeaf().openFile(file);
-        };
+        if (!inScope(r.date, globalCache.ref, globalCache.scope)) continue;
 
         let desc = "";
         const dm = r.text.match(/^(.*?)(?:\s+[+-]?\d|#)/);
+
         if (dm && dm[1].trim()) desc = dm[1].trim();
         else
           desc = r.text
@@ -1190,63 +1283,159 @@ try {
             .trim();
 
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-      <td class="col-page"></td>
-      <td>${desc}</td>
-      <td>${r.cat}</td>
-      <td>${r.movementDetail}</td>
-      <td>${Math.abs(r.availableSnapshot)}</td>
-      <td>${Math.abs(r.cardSnapshot)}</td>
-      <td>${r.cashSnapshot}</td>
-    `;
-        tr.querySelector(".col-page").appendChild(link);
-        table.appendChild(tr);
+
+        const tdDate = document.createElement("td");
+        tdDate.className = "col-page";
+        tdDate.dataset.date = r.date.toISODate();
+        tdDate.textContent = r.date.toFormat("dd-MM");
+
+        const tdDesc = document.createElement("td");
+        tdDesc.className = "col-desc";
+        tdDesc.textContent = desc;
+
+        const tdAmount = document.createElement("td");
+        tdAmount.className = "col-money";
+        tdAmount.textContent = parseMoney(r.raw);
+
+        const tdSaldo = document.createElement("td");
+        tdSaldo.className = "col-money";
+        tdSaldo.textContent = parseMoney(r.snapshot.card + r.snapshot.cash);
+
+        const tdCard = document.createElement("td");
+        tdCard.className = "col-money";
+        tdCard.textContent = parseMoney(r.snapshot.card);
+
+        const tdCash = document.createElement("td");
+        tdCash.className = "col-money";
+        tdCash.textContent = parseMoney(r.snapshot.cash);
+
+        tr.append(tdDate, tdDesc, tdAmount, tdSaldo, tdCard, tdCash);
+        frag.appendChild(tr);
       }
 
-      financeDiv.appendChild(table);
+      tbody.appendChild(frag);
+      table.append(thead, tbody);
+
+      table.addEventListener(
+        "click",
+        (event) => {
+          const cell = event.target.closest(".col-page");
+          if (cell) openOrCreateFile(cell.dataset.date);
+        },
+        { passive: true },
+      );
+
+      return table;
     }
+
+    const frag = document.createDocumentFragment();
+
+    if (globalCache.finance.debts.isEmpty) renderDebts();
+    if (
+      globalCache.finance.scoped.income > 0 ||
+      globalCache.finance.scoped.expense > 0
+    ) {
+      renderGraphBar();
+      renderCategoriesGraph();
+      frag.appendChild(debtsSpace);
+      frag.appendChild(chartsWrap);
+    }
+
+    if (globalCache.finance.scoped.expense > 0)
+      frag.appendChild(renderDetails());
+
+    financeSpace.replaceChildren(frag);
   }
 
-  /* ========== RENDER MASTER ========== */
-  async function renderAll() {
-    indexed = await refreshData();
-    renderTable();
-    renderHealth(indexed.healthSeries);
-    renderFinances(indexed.financeScope);
+  async function render() {
+    if (!globalCache.init) {
+      // render projects
+      renderProjects();
+    }
+    renderPaginator();
+    renderCalendar();
+    renderHealth();
+    renderFinances();
   }
 
   /* ========== CONTROLES: handlers ========== */
   scopeSelect.onchange = (e) => {
-    state.scope = e.target.value;
+    globalCache.scope = e.target.value;
     // reset reference to current when changing scope for clarity
-    state.ref = DateTime.now();
-    renderAll();
+    globalCache.ref = DateTime.now();
+    refresh();
   };
   // si haces -1 month sobre el 29 al 31 de marzo, seguirá siendo marzo o te lo reduce al 28 de febrero?
   navPrev.onclick = () => {
-    state.ref =
-      state.scope === "week"
-        ? state.ref.minus({ weeks: 1 })
-        : state.ref.minus({ months: 1 });
-    renderAll();
+    globalCache.ref =
+      globalCache.scope === "week"
+        ? globalCache.ref.minus({ weeks: 1 })
+        : globalCache.ref.minus({ months: 1 });
+    refresh();
   };
   navNext.onclick = () => {
-    state.ref =
-      state.scope === "week"
-        ? state.ref.plus({ weeks: 1 })
-        : state.ref.plus({ months: 1 });
-    renderAll();
+    globalCache.ref =
+      globalCache.scope === "week"
+        ? globalCache.ref.plus({ weeks: 1 })
+        : globalCache.ref.plus({ months: 1 });
+    refresh();
   };
+  /*
+   *
+   * INITIALIZATION
+   *
+   */
 
-  /* ========== INIT ========== */
-  indexed = await refreshData();
-  renderProjects(indexed.projectRecords);
-  await renderAll();
+  const repo = new DataRepository();
+  let fetched = null;
+
+  async function init() {
+    fetched = repo.fetch();
+    await index(fetched);
+    await render();
+    globalCache.init = true;
+  }
+
+  async function refresh() {
+    reset();
+    fetched = repo.fetch();
+    await index(fetched);
+    await render();
+  }
+
+  function reset() {
+    globalCache.weeks = {};
+    globalCache.finance = {
+      scoped: {
+        card: 0,
+        cash: 0,
+        income: 0,
+        expense: 0,
+        byCategory: {},
+      },
+      byMonth: {},
+      debts: {
+        cobrar: [],
+        pagar: [],
+        totalCobrar: 0,
+        totalPagar: 0,
+        isEmpty: true, //  se podría quitar esto y en su lugar hacer un check de si es empty o no para hacer skip??
+      },
+    };
+    globalCache.healthIndex = {
+      isEmpty: true,
+      days: [],
+      quality: [],
+      water: [],
+      hours: [],
+    };
+    calendarSpace.innerHTML = "";
+  }
+  await init();
 } catch (error) {
-  console.log(error);
   if (!input) {
-    dv.span(
-      '> [!ERROR] ERROR: No se han agregado las llaves\n> \n> Debe introducir los siguientes parámetros\n>\n> `{account: "", cash: "", savings: "", savings_goal: ""}`\n> para continuar.\n>\n> Si no quiere añadir ningún valor, solo mantenga las llaves "`{}`"\n> ejemplo:\n> ```\n> dv.view("scripts/dashboard.js",{})\n>                                ^^\n>```\n>',
-    );
+    dv.span("> [!error] necesito los brackets {}");
+  } else {
+    console.log(error);
   }
 }
